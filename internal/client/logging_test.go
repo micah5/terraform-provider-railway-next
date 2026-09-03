@@ -42,26 +42,37 @@ func TestLogRequestNamesEmptyVariables(t *testing.T) {
 	}
 }
 
-// TestLogRequestKeepsValuesOutOfDebug is the privacy half of the contract.
+// TestLogRequestKeepsValuesOutOfTrace is the privacy half of the contract.
 //
-// Variables carry whatever the practitioner configured, so the values belong at
-// TRACE — a deliberate opt-in — while DEBUG carries only the operation and the
-// keys. A provider that spilled configuration values at DEBUG would be one
-// nobody could safely run with `TF_LOG=DEBUG` in CI.
-func TestLogRequestKeepsValuesOutOfDebug(t *testing.T) {
+// Variables carry whatever the practitioner configured, so their values never
+// belong in provider logs — including TRACE, which commonly lands in CI logs or
+// a TF_LOG_PATH file. Keys and empty-variable names are sufficient to diagnose
+// malformed requests.
+func TestLogRequestKeepsValuesOutOfTrace(t *testing.T) {
 
-	logged := captureProviderLog(t, hclog.Debug, func(ctx context.Context) {
+	logged := captureProviderLog(t, hclog.Trace, func(ctx context.Context) {
 		logRequest(ctx, requestEnvelope{
-			OperationName: "UpdateServiceInstance",
-			Variables:     map[string]any{"serviceId": "a-configured-value"},
+			OperationName: "UpsertVariables",
+			Variables: map[string]any{
+				"serviceId": "service-fixture",
+				"input": map[string]any{
+					"variables": map[string]any{
+						"API_KEY": "super-secret-value",
+					},
+				},
+			},
 		})
 	})
 
-	if strings.Contains(logged, "a-configured-value") {
-		t.Errorf("a variable VALUE reached the debug log:\n%s", logged)
+	for _, secret := range []string{"service-fixture", "super-secret-value", "API_KEY"} {
+		if strings.Contains(logged, secret) {
+			t.Errorf("variable value %q reached the trace log:\n%s", secret, logged)
+		}
 	}
-	if !strings.Contains(logged, "serviceId") {
-		t.Errorf("the variable KEY should still be at debug:\n%s", logged)
+	for _, key := range []string{"serviceId", "input"} {
+		if !strings.Contains(logged, key) {
+			t.Errorf("top-level variable key %q should still be logged:\n%s", key, logged)
+		}
 	}
 }
 

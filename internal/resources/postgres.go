@@ -114,6 +114,7 @@ func (r *Postgres) Configure(_ context.Context, req resource.ConfigureRequest, r
 }
 
 func (r *Postgres) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	stateCtx := ctx
 	var plan postgresModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -150,6 +151,10 @@ func (r *Postgres) Create(ctx context.Context, req resource.CreateRequest, resp 
 		payload,
 		message,
 	)
+	if err != nil && !client.IsAmbiguousMutationError(err) {
+		resp.Diagnostics.AddError("Unable to create Railway PostgreSQL", client.DecodeAPIError(err).Error())
+		return
+	}
 	ids, reconcileErr := r.waitForPostgres(
 		ctx,
 		plan.ProjectID.ValueString(),
@@ -158,14 +163,26 @@ func (r *Postgres) Create(ctx context.Context, req resource.CreateRequest, resp 
 		time.Second,
 	)
 	if reconcileErr != nil || ids == nil {
-		detail := "Railway did not expose exactly one PostgreSQL service and attached data volume with the requested name within 60 seconds."
+		detail := "Railway did not expose exactly one PostgreSQL service and attached data volume with the requested name before the create timeout expired."
 		if err != nil {
 			detail += " The apply request also returned: " + client.DecodeAPIError(err).Error()
 		}
 		if reconcileErr != nil {
 			detail += " Reconciliation returned: " + client.DecodeAPIError(reconcileErr).Error()
 		}
-		resp.Diagnostics.AddError("Unable to confirm Railway PostgreSQL creation", detail)
+		plan.ID = pendingResourceID("postgres")
+		plan.ServiceID = types.StringNull()
+		plan.VolumeID = types.StringNull()
+		plan.VolumeInstanceID = types.StringNull()
+		value, converted := types.MapValueFrom(stateCtx, types.StringType, references.Postgres(plan.Name.ValueString()))
+		resp.Diagnostics.Append(converted...)
+		plan.References = value
+		ResolveUnknowns(&plan)
+		resp.Diagnostics.Append(resp.State.Set(stateCtx, &plan)...)
+		resp.Diagnostics.AddWarning(
+			"Railway PostgreSQL creation is still pending",
+			detail+" Terraform saved a pending identity and will adopt the service and volume by project, environment, and name on a later refresh instead of creating a duplicate.",
+		)
 		return
 	}
 	plan.ServiceID = types.StringValue(ids.ServiceID)
@@ -188,6 +205,7 @@ func (r *Postgres) Create(ctx context.Context, req resource.CreateRequest, resp 
 }
 
 func (r *Postgres) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	stateCtx := ctx
 	var state postgresModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -198,6 +216,21 @@ func (r *Postgres) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 	defer cancel()
+	if isPendingResourceID(state.ID, "postgres") {
+		ready, err := r.adoptPending(ctx, &state)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway PostgreSQL", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddWarning(
+				"Railway PostgreSQL creation is still pending",
+				"The earlier change set may still be applying. Terraform retained the provisional state and will check again on the next refresh.",
+			)
+			resp.Diagnostics.Append(resp.State.Set(stateCtx, &state)...)
+			return
+		}
+	}
 	if !r.refresh(ctx, &state, &resp.Diagnostics) {
 		if !resp.Diagnostics.HasError() {
 			resp.State.RemoveResource(ctx)
@@ -209,7 +242,9 @@ func (r *Postgres) Read(ctx context.Context, req resource.ReadRequest, resp *res
 
 func (r *Postgres) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan postgresModel
+	var prior postgresModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -218,6 +253,28 @@ func (r *Postgres) Update(ctx context.Context, req resource.UpdateRequest, resp 
 		return
 	}
 	defer cancel()
+	// These component ids are computed and therefore unknown in an update plan.
+	// They identify the existing composite resource, so carry them from prior
+	// state rather than sending empty ids to Railway.
+	plan.ID = prior.ID
+	plan.ServiceID = prior.ServiceID
+	plan.VolumeID = prior.VolumeID
+	plan.VolumeInstanceID = prior.VolumeInstanceID
+	if isPendingResourceID(prior.ID, "postgres") {
+		ready, err := r.adoptPending(ctx, &prior)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway PostgreSQL", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddError("Railway PostgreSQL creation is still pending", "Terraform will not update or recreate the database until Railway exposes the result of the earlier change set.")
+			return
+		}
+		plan.ID = prior.ID
+		plan.ServiceID = prior.ServiceID
+		plan.VolumeID = prior.VolumeID
+		plan.VolumeInstanceID = prior.VolumeInstanceID
+	}
 	unlockEnvironment := lockEnvironmentChangeSet(plan.EnvironmentID.ValueString())
 	defer unlockEnvironment()
 	_, err := railway.UpdateService(ctx, r.client.GraphQL(), plan.ServiceID.ValueString(), railway.ServiceUpdateInput{
@@ -245,6 +302,17 @@ func (r *Postgres) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 	defer cancel()
+	if isPendingResourceID(state.ID, "postgres") {
+		ready, err := r.adoptPending(ctx, &state)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway PostgreSQL", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddError("Railway PostgreSQL creation is still pending", "Terraform cannot safely forget this provisional state because the service and volume may still appear after destroy. Retry after Railway finishes applying the earlier change set.")
+			return
+		}
+	}
 	serviceDeletedByChangeSet := false
 	payload, err := changeset.DeletePostgres(state.Name.ValueString(), state.Version.ValueString(), state.Region.ValueString()).JSON()
 	if err == nil {
@@ -428,6 +496,23 @@ func (r *Postgres) findPostgres(
 		}, nil
 	}
 	return nil, nil
+}
+
+func (r *Postgres) adoptPending(ctx context.Context, state *postgresModel) (bool, error) {
+	ids, err := r.findPostgres(
+		ctx,
+		state.ProjectID.ValueString(),
+		state.EnvironmentID.ValueString(),
+		state.Name.ValueString(),
+	)
+	if err != nil || ids == nil {
+		return false, err
+	}
+	state.ID = types.StringValue(ids.ServiceID)
+	state.ServiceID = state.ID
+	state.VolumeID = types.StringValue(ids.VolumeID)
+	state.VolumeInstanceID = types.StringValue(ids.VolumeInstanceID)
+	return true, nil
 }
 
 func (r *Postgres) waitForPostgres(

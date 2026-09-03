@@ -74,6 +74,98 @@ resource "railway_service" "api" {
 	})
 }
 
+// TestServiceProtocolBranchUpdateUpdatesDeploymentTrigger guards the v0.2
+// ownership boundary: railway_service.branch is the branch watched by the
+// service-managed trigger unless auto_deploy is disabled. Updating it must
+// change Railway before the provider refreshes state, otherwise Terraform sees
+// the old remote branch and reports an inconsistent result after apply.
+func TestServiceProtocolBranchUpdateUpdatesDeploymentTrigger(t *testing.T) {
+	var fixture serviceFixture
+	server := httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
+	defer server.Close()
+
+	config := func(branch string) string {
+		return fmt.Sprintf(`
+provider "railway" {
+  token            = "fixture-token"
+  token_type       = "account"
+  graphql_endpoint = %q
+}
+
+resource "railway_service" "api" {
+  project_id     = "project-fixture"
+  environment_id = "environment-fixture"
+  name           = "api"
+  source_type    = "github"
+  repository     = "owner/repository"
+  branch         = %q
+}
+`, server.URL, branch)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: map[string]func() (tfprotov6.ProviderServer, error){
+			"railway": providerserver.NewProtocol6WithError(New("test")()),
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config("master"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("railway_service.api", "branch", "master"),
+					resource.TestCheckResourceAttr("railway_service.api", "deployment_trigger_id", "trigger-fixture"),
+				),
+			},
+			{
+				Config: config("develop"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("railway_service.api", "branch", "develop"),
+					resource.TestCheckResourceAttr("railway_service.api", "deployment_trigger_id", "trigger-fixture"),
+				),
+			},
+		},
+	})
+
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.triggerUpdates == 0 {
+		t.Fatal("branch change never called deploymentTriggerUpdate")
+	}
+}
+
+func TestServiceProtocolUsesRepositoryDefaultBranchWhenOmitted(t *testing.T) {
+	var fixture serviceFixture
+	server := httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
+	defer server.Close()
+
+	config := fmt.Sprintf(`
+provider "railway" {
+  token            = "fixture-token"
+  token_type       = "account"
+  graphql_endpoint = %q
+}
+
+resource "railway_service" "api" {
+  project_id     = "project-fixture"
+  environment_id = "environment-fixture"
+  name           = "api"
+  source_type    = "github"
+  repository     = "owner/repository"
+}
+`, server.URL)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: map[string]func() (tfprotov6.ProviderServer, error){
+			"railway": providerserver.NewProtocol6WithError(New("test")()),
+		},
+		Steps: []resource.TestStep{{
+			Config: config,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("railway_service.api", "branch", "main"),
+			),
+		}},
+	})
+}
+
 func checkNoUnknownState(name string) resource.TestCheckFunc {
 	return func(state *terraform.State) error {
 		instance, ok := state.RootModule().Resources[name]
@@ -93,6 +185,10 @@ type serviceFixture struct {
 	mu              sync.Mutex
 	exists          bool
 	connected       bool
+	triggerExists   bool
+	repository      string
+	branch          string
+	triggerUpdates  int
 	getServiceCalls int
 }
 
@@ -111,6 +207,8 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch request.OperationName {
+	case "GetGitHubRepository":
+		_, _ = io.WriteString(w, `{"data":{"githubRepo":{"defaultBranch":"main"}}}`)
 	case "CreateService":
 		// THE SOURCE IS ATTACHED BY THE CREATE ITSELF now, matching Railway's
 		// own API cookbook — `ServiceCreateInput` carries `source` and
@@ -122,6 +220,10 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, hasSource := variables["source"]; hasSource {
 				f.connected = true
 			}
+			f.branch, _ = variables["branch"].(string)
+			if source, ok := variables["source"].(map[string]any); ok {
+				f.repository, _ = source["repo"].(string)
+			}
 		}
 		writeServiceMutation(w, "serviceCreate")
 	case "ConnectService":
@@ -129,6 +231,25 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeServiceMutation(w, "serviceConnect")
 	case "UpdateServiceInstance":
 		_, _ = io.WriteString(w, `{"data":{"serviceInstanceUpdate":true}}`)
+	case "CreateDeploymentTrigger":
+		input, _ := request.Variables["input"].(map[string]any)
+		f.triggerExists = true
+		f.branch, _ = input["branch"].(string)
+		f.repository, _ = input["repository"].(string)
+		writeServiceDeploymentTriggerMutation(w, "deploymentTriggerCreate", f.repository, f.branch)
+	case "UpdateDeploymentTrigger":
+		input, _ := request.Variables["input"].(map[string]any)
+		if branch, ok := input["branch"].(string); ok {
+			f.branch = branch
+		}
+		if repository, ok := input["repository"].(string); ok {
+			f.repository = repository
+		}
+		f.triggerUpdates++
+		writeServiceDeploymentTriggerMutation(w, "deploymentTriggerUpdate", f.repository, f.branch)
+	case "DeleteDeploymentTrigger":
+		f.triggerExists = false
+		_, _ = io.WriteString(w, `{"data":{"deploymentTriggerDelete":true}}`)
 	case "GetEnvironmentPrivateNetworks":
 		// **THE FIXTURE REPORTS NO PRIVATE NETWORK**, which is a real state:
 		// private networking can be disabled. `privatenet.Read` treats
@@ -144,13 +265,17 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.getServiceCalls++
 		repoTriggers := []any{}
 		var source any
-		if f.connected {
+		if f.triggerExists {
 			repoTriggers = []any{map[string]any{
 				"node": map[string]any{
 					"id": "trigger-fixture", "environmentId": "environment-fixture",
-					"branch": "master", "repository": "owner/repository",
+					"branch": f.branch, "repository": f.repository,
+					"provider": "github", "projectId": "project-fixture",
+					"serviceId": "service-fixture", "checkSuites": false,
 				},
 			}}
+		}
+		if f.connected {
 			source = map[string]any{"image": nil, "repo": "owner/repository"}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
@@ -186,10 +311,22 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}})
 	case "DeleteService":
 		f.exists = false
+		f.triggerExists = false
 		_, _ = io.WriteString(w, `{"data":{"serviceDelete":true}}`)
 	default:
 		http.Error(w, "unexpected operation "+request.OperationName, http.StatusBadRequest)
 	}
+}
+
+func writeServiceDeploymentTriggerMutation(w io.Writer, field, repository, branch string) {
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+		field: map[string]any{
+			"id": "trigger-fixture", "branch": branch, "repository": repository,
+			"provider": "github", "projectId": "project-fixture",
+			"environmentId": "environment-fixture", "serviceId": "service-fixture",
+			"checkSuites": false,
+		},
+	}})
 }
 
 func writeServiceMutation(w io.Writer, field string) {

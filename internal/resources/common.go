@@ -24,9 +24,18 @@ const (
 	defaultUpdateTimeout = 15 * time.Minute
 	defaultDeleteTimeout = 15 * time.Minute
 	changeSetMaxAttempts = 4
+	pendingIDPrefix      = "terraform-pending:"
 )
 
 var environmentChangeSetLocks sync.Map
+
+func pendingResourceID(kind string) types.String {
+	return types.StringValue(pendingIDPrefix + kind)
+}
+
+func isPendingResourceID(value types.String, kind string) bool {
+	return !value.IsNull() && !value.IsUnknown() && value.ValueString() == pendingIDPrefix+kind
+}
 
 func lockEnvironmentChangeSet(environmentID string) func() {
 	value, _ := environmentChangeSetLocks.LoadOrStore(environmentID, &sync.Mutex{})

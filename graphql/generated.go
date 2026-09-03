@@ -1883,6 +1883,27 @@ type GetEnvironmentResponse struct {
 // GetEnvironment returns GetEnvironmentResponse.Environment, and is useful for accessing the field via an interface.
 func (v *GetEnvironmentResponse) GetEnvironment() GetEnvironmentEnvironment { return v.Environment }
 
+// GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation includes the requested fields of the GraphQL type GitHubRepoWithoutInstallation.
+type GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation struct {
+	DefaultBranch string `json:"defaultBranch"`
+}
+
+// GetDefaultBranch returns GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation.DefaultBranch, and is useful for accessing the field via an interface.
+func (v *GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation) GetDefaultBranch() string {
+	return v.DefaultBranch
+}
+
+// GetGitHubRepositoryResponse is returned by GetGitHubRepository on success.
+type GetGitHubRepositoryResponse struct {
+	// Checks if user has access to GitHub repository
+	GithubRepo GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation `json:"githubRepo"`
+}
+
+// GetGithubRepo returns GetGitHubRepositoryResponse.GithubRepo, and is useful for accessing the field via an interface.
+func (v *GetGitHubRepositoryResponse) GetGithubRepo() GetGitHubRepositoryGithubRepoGitHubRepoWithoutInstallation {
+	return v.GithubRepo
+}
+
 // GetProjectProject includes the requested fields of the GraphQL type Project.
 type GetProjectProject struct {
 	ProjectFields `json:"-"`
@@ -5483,6 +5504,14 @@ type __GetEnvironmentPrivateNetworksInput struct {
 // GetEnvironmentId returns __GetEnvironmentPrivateNetworksInput.EnvironmentId, and is useful for accessing the field via an interface.
 func (v *__GetEnvironmentPrivateNetworksInput) GetEnvironmentId() string { return v.EnvironmentId }
 
+// __GetGitHubRepositoryInput is used internally by genqlient
+type __GetGitHubRepositoryInput struct {
+	FullRepoName string `json:"fullRepoName"`
+}
+
+// GetFullRepoName returns __GetGitHubRepositoryInput.FullRepoName, and is useful for accessing the field via an interface.
+func (v *__GetGitHubRepositoryInput) GetFullRepoName() string { return v.FullRepoName }
+
 // __GetProjectInput is used internally by genqlient
 type __GetProjectInput struct {
 	Id string `json:"id"`
@@ -5967,16 +5996,9 @@ fragment DeploymentTriggerFields on DeploymentTrigger {
 }
 `
 
-// THE THING THAT MAKES A GITHUB-SOURCED SERVICE ACTUALLY DEPLOY.
-//
-// **A SERVICE CAN HAVE A REPOSITORY ATTACHED AND STILL NEVER BUILD.** The
-// source tells Railway what the service is made of; the TRIGGER is what
-// connects a push on a branch to a deployment. Without one the service sits
-// with `latestDeployment: null` forever, and nothing in the Railway UI or the
-// API says why — it looks correctly configured, because it is, apart from this.
-//
-// Observed against a live account: four services with their sources correctly
-// attached, zero `repoTriggers` between them, and no deployment ever.
+// THE THING THAT MAKES A GITHUB-SOURCED SERVICE ACTUALLY DEPLOY. The service
+// resource manages one by default; the standalone resource uses the same
+// operations when explicit ownership is requested.
 func CreateDeploymentTrigger(
 	ctx_ context.Context,
 	client_ graphql.Client,
@@ -6748,6 +6770,40 @@ func GetEnvironmentPrivateNetworks(
 	}
 
 	data_ = &GetEnvironmentPrivateNetworksResponse{}
+	resp_ := &graphql.Response{Data: data_}
+
+	err_ = client_.MakeRequest(
+		ctx_,
+		req_,
+		resp_,
+	)
+
+	return data_, err_
+}
+
+// The query executed by GetGitHubRepository.
+const GetGitHubRepository_Operation = `
+query GetGitHubRepository ($fullRepoName: String!) {
+	githubRepo(fullRepoName: $fullRepoName) {
+		defaultBranch
+	}
+}
+`
+
+func GetGitHubRepository(
+	ctx_ context.Context,
+	client_ graphql.Client,
+	fullRepoName string,
+) (data_ *GetGitHubRepositoryResponse, err_ error) {
+	req_ := &graphql.Request{
+		OpName: "GetGitHubRepository",
+		Query:  GetGitHubRepository_Operation,
+		Variables: &__GetGitHubRepositoryInput{
+			FullRepoName: fullRepoName,
+		},
+	}
+
+	data_ = &GetGitHubRepositoryResponse{}
 	resp_ := &graphql.Response{Data: data_}
 
 	err_ = client_.MakeRequest(

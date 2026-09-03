@@ -2,7 +2,7 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-03
 
 ### Fixed
 
@@ -50,19 +50,24 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 - `railway_bucket` deletion is now verified rather than assumed. The change set
   reported success while leaving the bucket registered, so Terraform recorded a
   destroy that had not happened.
+- TRACE request logging no longer includes GraphQL variable values. Variables
+  can contain write-only secrets, so all log levels now expose only operation
+  names, top-level variable keys, and the names of empty string variables.
+- Changing `railway_service.branch` now updates the deployment trigger before
+  state is refreshed, avoiding `Provider produced inconsistent result after
+  apply` when moving a service from one watched branch to another.
+- Bucket and PostgreSQL creates that time out after Railway accepts their
+  change set now save a non-tainted provisional identity. A later refresh
+  adopts the real bucket, service, and volume IDs by scoped name instead of
+  submitting a duplicate create or leaving an orphan in Railway.
 
 ### Added
 
-- **`railway_deployment_trigger`, without which a GitHub-sourced service never
-  deploys.** `railway_service`'s `repository` and `branch` say what a service is
-  made of; they do not subscribe it to anything. A four-service environment
-  applied cleanly, showed the right source on every service, and had zero
-  deployments — the only symptom was that nothing was reachable, with no error
-  anywhere. It is a separate resource because a service may be built from an
-  image (no trigger possible), from a repository with continuous deployment (one
-  trigger), or from a repository deployed only by CI (a source, deliberately no
-  trigger); folding it into the service would make the third case
-  unexpressible.
+- **`railway_deployment_trigger` for explicit trigger management.** A GitHub
+  `railway_service` continues to manage one trigger by default, preserving the
+  original push-to-deploy workflow. Set `auto_deploy = false` on the service
+  when the standalone resource should be the sole owner, such as for explicit
+  check-suite gating, multiple triggers, or a source deployed only by CI.
 - `ephemeral.railway_bucket_credentials` and
   `data.railway_bucket_credentials` — the same S3 credential lookup in two
   forms. The ephemeral resource is the default and never persists. The data
@@ -91,7 +96,8 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 - Structured request logging through `tflog`, so `TF_LOG` shows which GraphQL
   operation ran and — the line that would have made the empty-id bug a
   five-minute diagnosis — which of its variables arrived EMPTY. Variable values
-  are logged at `TRACE` only; keys and operation names at `DEBUG`.
+  are never logged; keys and operation names are available at `DEBUG` and
+  `TRACE`.
 
 ### Changed
 

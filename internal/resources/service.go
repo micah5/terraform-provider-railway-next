@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -39,6 +40,8 @@ type serviceModel struct {
 	Repository             types.String   `tfsdk:"repository"`
 	Image                  types.String   `tfsdk:"image"`
 	Branch                 types.String   `tfsdk:"branch"`
+	AutoDeploy             types.Bool     `tfsdk:"auto_deploy"`
+	DeploymentTriggerID    types.String   `tfsdk:"deployment_trigger_id"`
 	RootDirectory          types.String   `tfsdk:"root_directory"`
 	ConfigPath             types.String   `tfsdk:"config_path"`
 	Builder                types.String   `tfsdk:"builder"`
@@ -116,11 +119,18 @@ func (r *Service) Schema(ctx context.Context, _ resource.SchemaRequest, resp *re
 					stringvalidator.OneOf("empty", "github", "image"),
 				},
 			},
-			"repository":     optionalComputedString("GitHub repository in owner/name form."),
-			"image":          optionalComputedString("Docker image reference."),
-			"branch":         optionalComputedString("Git branch."),
-			"root_directory": optionalComputedString("Repository root directory for this service."),
-			"config_path":    optionalComputedString("Railway configuration file path."),
+			"repository": optionalComputedString("GitHub repository in owner/name form."),
+			"image":      optionalComputedString("Docker image reference."),
+			"branch":     optionalComputedString("Git branch used for automatic deployments."),
+			"auto_deploy": schema.BoolAttribute{
+				Optional:            true,
+				Computed:            true,
+				Default:             booldefault.StaticBool(true),
+				MarkdownDescription: "Create and manage the GitHub deployment trigger for this service. Set false when managing triggers with railway_deployment_trigger or deploying only from CI/manual workflows.",
+			},
+			"deployment_trigger_id": idAttribute("Railway deployment trigger managed by this service when auto_deploy is enabled."),
+			"root_directory":        optionalComputedString("Repository root directory for this service."),
+			"config_path":           optionalComputedString("Railway configuration file path."),
 			"builder": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
@@ -209,6 +219,7 @@ func (r *Service) Configure(_ context.Context, req resource.ConfigureRequest, re
 }
 
 func (r *Service) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	stateCtx := ctx
 	var plan serviceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() || !validateServiceSource(&plan, &resp.Diagnostics) {
@@ -221,6 +232,9 @@ func (r *Service) Create(ctx context.Context, req resource.CreateRequest, resp *
 	defer cancel()
 	unlockEnvironment := lockEnvironmentChangeSet(plan.EnvironmentID.ValueString())
 	defer unlockEnvironment()
+	if !r.resolveGitHubBranch(ctx, &plan, &resp.Diagnostics) {
+		return
+	}
 	// **THE SOURCE GOES IN THE CREATE, not a second mutation.**
 	//
 	// `ServiceCreateInput` accepts `source` and `branch`, and Railway's own API
@@ -292,10 +306,22 @@ func (r *Service) Create(ctx context.Context, req resource.CreateRequest, resp *
 	// configuration from state, which is worse than the orphan being fixed.
 	saveState := func() {
 		ResolveUnknowns(&plan)
-		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		resp.Diagnostics.Append(resp.State.Set(stateCtx, &plan)...)
 	}
 
+	if err := r.waitForServiceInstance(ctx, &plan); err != nil {
+		resp.Diagnostics.AddError(
+			"Railway service created but its environment instance is not ready",
+			client.DecodeAPIError(err).Error(),
+		)
+		saveState()
+		return
+	}
 	if !r.updateInstance(ctx, &plan, &resp.Diagnostics) {
+		saveState()
+		return
+	}
+	if !r.reconcileDeploymentTrigger(ctx, &plan, nil, &resp.Diagnostics) {
 		saveState()
 		return
 	}
@@ -341,6 +367,9 @@ func (r *Service) Update(ctx context.Context, req resource.UpdateRequest, resp *
 	defer cancel()
 	unlockEnvironment := lockEnvironmentChangeSet(plan.EnvironmentID.ValueString())
 	defer unlockEnvironment()
+	if !r.resolveGitHubBranch(ctx, &plan, &resp.Diagnostics) {
+		return
+	}
 	if plan.Name.ValueString() != prior.Name.ValueString() {
 		_, err := railway.UpdateService(ctx, r.client.GraphQL(), plan.ID.ValueString(), railway.ServiceUpdateInput{
 			Name: stringPointer(plan.Name),
@@ -350,7 +379,7 @@ func (r *Service) Update(ctx context.Context, req resource.UpdateRequest, resp *
 			return
 		}
 	}
-	if sourceChanged(&plan, &prior) {
+	if serviceSourceChanged(&plan, &prior) {
 		// **`serviceInstanceUpdate`, NOT `serviceConnect`** — for the same
 		// reason Create no longer uses the latter.
 		//
@@ -390,6 +419,9 @@ func (r *Service) Update(ctx context.Context, req resource.UpdateRequest, resp *
 		// need.
 	}
 	if !r.updateInstance(ctx, &plan, &resp.Diagnostics) {
+		return
+	}
+	if !r.reconcileDeploymentTrigger(ctx, &plan, &prior, &resp.Diagnostics) {
 		return
 	}
 	if !r.refresh(ctx, &plan, true, &resp.Diagnostics) {
@@ -541,6 +573,8 @@ func (r *Service) refresh(
 	configuredRepository := state.Repository
 	configuredImage := state.Image
 	configuredBranch := state.Branch
+	configuredAutoDeploy := state.AutoDeploy
+	configuredTriggerID := state.DeploymentTriggerID
 	result, err := railway.GetService(
 		ctx,
 		r.client.GraphQL(),
@@ -575,13 +609,39 @@ func (r *Service) refresh(
 	}
 	setServiceInstanceState(ctx, state, instance, diagnostics)
 
+	state.DeploymentTriggerID = types.StringNull()
 	branchFound := false
-	for _, edge := range result.Service.RepoTriggers.Edges {
-		if edge.Node.EnvironmentId == state.EnvironmentID.ValueString() {
-			state.Branch = types.StringValue(edge.Node.Branch)
-			branchFound = true
-			break
+	if state.SourceType.ValueString() == "github" &&
+		(configuredAutoDeploy.IsNull() || configuredAutoDeploy.IsUnknown() || configuredAutoDeploy.ValueBool()) {
+		var fallbackID string
+		var fallbackBranch string
+		for _, edge := range result.Service.RepoTriggers.Edges {
+			if edge.Node.EnvironmentId != state.EnvironmentID.ValueString() {
+				continue
+			}
+			if edge.Node.Id == configuredTriggerID.ValueString() ||
+				(edge.Node.Repository == state.Repository.ValueString() && edge.Node.Branch == configuredBranch.ValueString()) {
+				fallbackID = edge.Node.Id
+				fallbackBranch = edge.Node.Branch
+				break
+			}
+			if fallbackID == "" {
+				fallbackID = edge.Node.Id
+				fallbackBranch = edge.Node.Branch
+			}
 		}
+		if fallbackID != "" {
+			state.AutoDeploy = types.BoolValue(true)
+			state.DeploymentTriggerID = types.StringValue(fallbackID)
+			state.Branch = types.StringValue(fallbackBranch)
+			branchFound = true
+		} else {
+			// Reflect deletion of the service-managed trigger so a configured
+			// auto_deploy=true plans an update that recreates it.
+			state.AutoDeploy = types.BoolValue(false)
+		}
+	} else {
+		state.AutoDeploy = configuredAutoDeploy
 	}
 	// Railway can expose a newly-created service instance before its connected
 	// source and repo trigger converge. During Create/Update only, retain the
@@ -599,7 +659,7 @@ func (r *Service) refresh(
 			state.Image = configuredImage
 		}
 	}
-	if preserveConfiguredSource && !branchFound && !configuredBranch.IsUnknown() {
+	if !branchFound && !configuredBranch.IsUnknown() {
 		state.Branch = configuredBranch
 	}
 	var opaque serviceEnvironmentConfig
@@ -744,11 +804,109 @@ func validateServiceSource(plan *serviceModel, diagnostics *diag.Diagnostics) bo
 	return true
 }
 
-func sourceChanged(plan, prior *serviceModel) bool {
+func serviceSourceChanged(plan, prior *serviceModel) bool {
 	return plan.SourceType.ValueString() != prior.SourceType.ValueString() ||
 		plan.Repository.ValueString() != prior.Repository.ValueString() ||
-		plan.Image.ValueString() != prior.Image.ValueString() ||
-		plan.Branch.ValueString() != prior.Branch.ValueString()
+		plan.Image.ValueString() != prior.Image.ValueString()
+}
+
+func (r *Service) resolveGitHubBranch(ctx context.Context, plan *serviceModel, diagnostics *diag.Diagnostics) bool {
+	if plan.SourceType.ValueString() != "github" ||
+		(!plan.Branch.IsNull() && !plan.Branch.IsUnknown() && plan.Branch.ValueString() != "") {
+		return true
+	}
+	repository, err := railway.GetGitHubRepository(ctx, r.client.GraphQL(), plan.Repository.ValueString())
+	if err != nil {
+		diagnostics.AddError("Unable to determine GitHub repository default branch", client.DecodeAPIError(err).Error())
+		return false
+	}
+	plan.Branch = types.StringValue(repository.GithubRepo.DefaultBranch)
+	return true
+}
+
+// reconcileDeploymentTrigger preserves the provider's original, convenient
+// GitHub workflow: declaring a repository and branch on railway_service is
+// enough for pushes to deploy. The source is still attached with the
+// environment-aware serviceInstanceUpdate mutation; the trigger is managed
+// separately through its own environment-aware API.
+//
+// auto_deploy=false opts out and makes railway_deployment_trigger the sole
+// owner. Tracking the implicit trigger id prevents either resource from
+// guessing when a service has several triggers.
+func (r *Service) reconcileDeploymentTrigger(
+	ctx context.Context,
+	plan *serviceModel,
+	prior *serviceModel,
+	diagnostics *diag.Diagnostics,
+) bool {
+	triggerID := plan.DeploymentTriggerID.ValueString()
+	if triggerID == "" && prior != nil {
+		triggerID = prior.DeploymentTriggerID.ValueString()
+	}
+
+	manage := plan.SourceType.ValueString() == "github" && plan.AutoDeploy.ValueBool()
+	if !manage {
+		if triggerID != "" {
+			if _, err := railway.DeleteDeploymentTrigger(ctx, r.client.GraphQL(), triggerID); err != nil && !client.IsNotFound(err) {
+				diagnostics.AddError("Unable to disable automatic Railway deployments", client.DecodeAPIError(err).Error())
+				return false
+			}
+		}
+		plan.DeploymentTriggerID = types.StringNull()
+		return true
+	}
+
+	// Upgrade and partial-create states may not yet carry the trigger id. Adopt
+	// the matching legacy trigger before creating anything, so v0.1 services do
+	// not receive a duplicate when first refreshed under v0.2.
+	if triggerID == "" {
+		result, err := railway.GetService(
+			ctx,
+			r.client.GraphQL(),
+			plan.ID.ValueString(),
+			plan.EnvironmentID.ValueString(),
+		)
+		if err != nil {
+			diagnostics.AddError("Unable to inspect Railway deployment triggers", client.DecodeAPIError(err).Error())
+			return false
+		}
+		for _, edge := range result.Service.RepoTriggers.Edges {
+			if edge.Node.EnvironmentId == plan.EnvironmentID.ValueString() &&
+				edge.Node.Repository == plan.Repository.ValueString() &&
+				edge.Node.Branch == plan.Branch.ValueString() {
+				triggerID = edge.Node.Id
+				break
+			}
+		}
+	}
+
+	if triggerID != "" {
+		result, err := railway.UpdateDeploymentTrigger(ctx, r.client.GraphQL(), triggerID, railway.DeploymentTriggerUpdateInput{
+			Branch:     stringPointer(plan.Branch),
+			Repository: stringPointer(plan.Repository),
+		})
+		if err != nil {
+			diagnostics.AddError("Unable to update Railway deployment trigger", client.DecodeAPIError(err).Error())
+			return false
+		}
+		plan.DeploymentTriggerID = types.StringValue(result.DeploymentTriggerUpdate.Id)
+		return true
+	}
+
+	result, err := railway.CreateDeploymentTrigger(ctx, r.client.GraphQL(), railway.DeploymentTriggerCreateInput{
+		ProjectId:     plan.ProjectID.ValueString(),
+		EnvironmentId: plan.EnvironmentID.ValueString(),
+		ServiceId:     plan.ID.ValueString(),
+		Repository:    plan.Repository.ValueString(),
+		Branch:        plan.Branch.ValueString(),
+		Provider:      "github",
+	})
+	if err != nil {
+		diagnostics.AddError("Unable to create Railway deployment trigger", client.DecodeAPIError(err).Error())
+		return false
+	}
+	plan.DeploymentTriggerID = types.StringValue(result.DeploymentTriggerCreate.Id)
+	return true
 }
 
 func builderPointer(value types.String) *railway.Builder {

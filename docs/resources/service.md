@@ -14,12 +14,15 @@ A Railway service and its configuration in one environment. Creation is distinct
 
 ```terraform
 resource "railway_service" "api" {
-  project_id       = railway_project.example.id
-  environment_id   = railway_project.example.default_environment_id
-  name             = "api"
-  source_type      = "github"
-  repository       = "acme/example"
-  branch           = "main"
+  project_id     = railway_project.example.id
+  environment_id = railway_project.example.default_environment_id
+  name           = "api"
+  source_type    = "github"
+  repository     = "acme/example"
+  branch         = "main"
+  # Defaults to true: pushes to the branch above build and deploy without a
+  # separate railway_deployment_trigger resource.
+  auto_deploy      = true
   root_directory   = "api"
   healthcheck_path = "/healthz"
   start_command    = "./api"
@@ -39,7 +42,8 @@ resource "railway_service" "api" {
 
 ### Optional
 
-- `branch` (String) Git branch.
+- `auto_deploy` (Boolean) Create and manage the GitHub deployment trigger for this service. Set false when managing triggers with railway_deployment_trigger or deploying only from CI/manual workflows.
+- `branch` (String) Git branch used for automatic deployments.
 - `build_command` (String) Custom build command.
 - `builder` (String)
 - `config_path` (String) Railway configuration file path.
@@ -67,6 +71,7 @@ resource "railway_service" "api" {
 
 ### Read-Only
 
+- `deployment_trigger_id` (String) Railway deployment trigger managed by this service when auto_deploy is enabled.
 - `has_ever_deployed` (Boolean) Whether any deployment was ever created for this service, including ones since removed. False on a service that has never built — which is what a missing `railway_deployment_trigger` looks like.
 - `id` (String) Railway service ID.
 - `latest_deployment_id` (String)

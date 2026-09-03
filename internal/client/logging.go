@@ -28,11 +28,11 @@ import (
 // about, which is the point — an operator already knows how to debug a
 // Terraform provider.
 //
-// **VARIABLES ARE LOGGED AT TRACE, NOT DEBUG.** They carry whatever a
-// practitioner put in their configuration. `DEBUG` gives the operation name and
-// the variable KEYS — enough to see which call failed and that `serviceId` was
-// among the arguments — while `TRACE` is the deliberate opt-in that also shows
-// the values.
+// **VARIABLE VALUES ARE NEVER LOGGED.** They carry whatever a practitioner put
+// in their configuration, including write-only secret values. `DEBUG` and
+// `TRACE` give the operation name, variable KEYS, and the names of empty string
+// variables — enough to diagnose a missing id without copying credentials into
+// a terminal, CI log, or TF_LOG_PATH file.
 //
 // The auth token never reaches here: it is applied as a header in `setHeaders`,
 // and headers are not logged. `tfsdklog`'s masking is a second line of defence
@@ -69,8 +69,5 @@ func logRequest(ctx context.Context, envelope requestEnvelope) {
 	}
 
 	tflog.Debug(ctx, "Railway GraphQL request", fields)
-	tflog.Trace(ctx, "Railway GraphQL request variables", map[string]any{
-		"railway_operation":       operation,
-		"railway_variable_values": envelope.Variables,
-	})
+	tflog.Trace(ctx, "Railway GraphQL request details", fields)
 }

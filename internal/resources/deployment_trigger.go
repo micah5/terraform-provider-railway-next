@@ -25,12 +25,9 @@ var (
 // DeploymentTrigger connects a branch to a service, which is what actually
 // makes a GitHub-sourced service deploy.
 //
-// **A SERVICE CAN HAVE A REPOSITORY ATTACHED AND NEVER BUILD, AND NOTHING SAYS
-// SO.** `railway_service`'s `repository` and `branch` tell Railway what the
-// service is made of. They do not subscribe it to anything. Without a
-// deployment trigger the service sits at `latestDeployment: null` forever,
-// while the UI and the API both show it as correctly configured — because it
-// is, apart from this.
+// railway_service manages one trigger by default for backward compatibility.
+// This resource is the explicit ownership path when that service sets
+// auto_deploy=false, including check-suite gating and multiple triggers.
 //
 // That is not hypothetical. A four-service environment applied cleanly, showed
 // the right source on every service, and had zero `repoTriggers` and zero
@@ -75,9 +72,8 @@ func (r *DeploymentTrigger) Schema(
 	resp *resource.SchemaResponse,
 ) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Subscribes a service to a branch, so a push deploys it. " +
-			"**A service with a repository source but no deployment trigger never builds** — " +
-			"it shows as correctly configured and stays at no deployment forever.",
+		MarkdownDescription: "Explicitly subscribes a service to a branch, so a push deploys it. " +
+			"Set auto_deploy=false on railway_service when this resource owns its trigger.",
 		Attributes: map[string]schema.Attribute{
 			"id": idAttribute("Railway deployment trigger ID."),
 			// EVERY IDENTIFYING FIELD REPLACES. Railway's update mutation

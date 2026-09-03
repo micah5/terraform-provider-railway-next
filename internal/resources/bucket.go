@@ -105,6 +105,7 @@ func (r *Bucket) Configure(_ context.Context, req resource.ConfigureRequest, res
 }
 
 func (r *Bucket) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	stateCtx := ctx
 	var plan bucketModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -141,6 +142,10 @@ func (r *Bucket) Create(ctx context.Context, req resource.CreateRequest, resp *r
 		payload,
 		message,
 	)
+	if err != nil && !client.IsAmbiguousMutationError(err) {
+		resp.Diagnostics.AddError("Unable to create Railway bucket", client.DecodeAPIError(err).Error())
+		return
+	}
 	bucket, reconcileErr := r.waitForBucketRegistration(
 		ctx,
 		plan.ProjectID.ValueString(),
@@ -157,38 +162,18 @@ func (r *Bucket) Create(ctx context.Context, req resource.CreateRequest, resp *r
 			detail += " Reconciliation returned: " + client.DecodeAPIError(reconcileErr).Error()
 		}
 
-		// THE CHANGE SET HAS ALREADY BEEN APPLIED, so the bucket is probably
-		// registering right now — this path is a TIMEOUT, not a rejection.
-		//
-		// Railway registers buckets asynchronously, so this is the likelier of
-		// the two failures here. Returning without state leaves a bucket
-		// nothing has a record of.
-		//
-		// Recovery from that is worse than for any other resource: the
-		// duplicate-name guard at the top of this function finds the orphan and
-		// hard-fails, and Railway holds a deleted bucket's name through its
-		// delayed permanent-deletion window — so deleting it by hand does not
-		// unblock the next apply either.
-		//
-		// So look once more before giving up. If the bucket did finish
-		// registering, record it and let the next apply reconcile the rest;
-		// only report an unrecoverable failure when there is genuinely nothing
-		// to adopt.
-		if late, lateErr := r.findBucketByName(ctx, plan.ProjectID.ValueString(), plan.Name.ValueString()); lateErr == nil && late != nil {
-			plan.ID = types.StringValue(late.Id)
-			plan.Name = types.StringValue(late.Name)
-			r.setReferences(ctx, &plan, &resp.Diagnostics)
-			resp.Diagnostics.AddWarning(
-				"Railway bucket registered after the confirmation window",
-				detail+" The bucket was found on a final check and has been saved to state; "+
-					"apply again to finish configuring it.",
-			)
-			ResolveUnknowns(&plan)
-			resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
-			return
-		}
-
-		resp.Diagnostics.AddError("Unable to confirm Railway bucket creation", detail)
+		// Never issue a final request on the expired operation context. Persist a
+		// provisional identity instead: the next Read resolves the project/name
+		// pair to Railway's real id once asynchronous registration becomes
+		// visible. This prevents a retry from creating a duplicate orphan.
+		plan.ID = pendingResourceID("bucket")
+		r.setReferences(stateCtx, &plan, &resp.Diagnostics)
+		ResolveUnknowns(&plan)
+		resp.Diagnostics.Append(resp.State.Set(stateCtx, &plan)...)
+		resp.Diagnostics.AddWarning(
+			"Railway bucket creation is still pending",
+			detail+" Terraform saved a pending identity and will adopt the bucket by project and name on a later refresh instead of creating a duplicate.",
+		)
 		return
 	}
 	plan.ID = types.StringValue(bucket.Id)
@@ -205,6 +190,7 @@ func (r *Bucket) Create(ctx context.Context, req resource.CreateRequest, resp *r
 }
 
 func (r *Bucket) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	stateCtx := ctx
 	var state bucketModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -215,6 +201,21 @@ func (r *Bucket) Read(ctx context.Context, req resource.ReadRequest, resp *resou
 		return
 	}
 	defer cancel()
+	if isPendingResourceID(state.ID, "bucket") {
+		ready, err := r.adoptPending(ctx, &state)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway bucket", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddWarning(
+				"Railway bucket creation is still pending",
+				"The earlier change set may still be applying. Terraform retained the provisional state and will check again on the next refresh.",
+			)
+			resp.Diagnostics.Append(resp.State.Set(stateCtx, &state)...)
+			return
+		}
+	}
 
 	buckets, err := railway.ListProjectBuckets(ctx, r.client.GraphQL(), state.ProjectID.ValueString())
 	if removeIfNotFound(ctx, err, resp, "Unable to read Railway bucket") {
@@ -252,7 +253,9 @@ func (r *Bucket) Read(ctx context.Context, req resource.ReadRequest, resp *resou
 
 func (r *Bucket) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan bucketModel
+	var prior bucketModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -261,6 +264,18 @@ func (r *Bucket) Update(ctx context.Context, req resource.UpdateRequest, resp *r
 		return
 	}
 	defer cancel()
+	if isPendingResourceID(prior.ID, "bucket") {
+		ready, err := r.adoptPending(ctx, &prior)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway bucket", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddError("Railway bucket creation is still pending", "Terraform will not update or recreate the bucket until Railway exposes the result of the earlier change set.")
+			return
+		}
+		plan.ID = prior.ID
+	}
 	unlockChangeSet := lockEnvironmentChangeSet(plan.EnvironmentID.ValueString())
 	defer unlockChangeSet()
 	result, err := railway.UpdateBucket(ctx, r.client.GraphQL(), plan.ID.ValueString(), railway.BucketUpdateInput{
@@ -287,6 +302,17 @@ func (r *Bucket) Delete(ctx context.Context, req resource.DeleteRequest, resp *r
 		return
 	}
 	defer cancel()
+	if isPendingResourceID(state.ID, "bucket") {
+		ready, err := r.adoptPending(ctx, &state)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to reconcile pending Railway bucket", client.DecodeAPIError(err).Error())
+			return
+		}
+		if !ready {
+			resp.Diagnostics.AddError("Railway bucket creation is still pending", "Terraform cannot safely forget this provisional state because the bucket may still appear after destroy. Retry after Railway finishes applying the earlier change set.")
+			return
+		}
+	}
 	payload, err := changeset.DeleteBucket(state.Name.ValueString(), state.Region.ValueString()).JSON()
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to build Railway bucket deletion", err.Error())
@@ -385,6 +411,20 @@ func (r *Bucket) findBucketByName(ctx context.Context, projectID, name string) (
 		found = &copy
 	}
 	return found, nil
+}
+
+func (r *Bucket) adoptPending(ctx context.Context, state *bucketModel) (bool, error) {
+	bucket, err := r.findBucketByName(ctx, state.ProjectID.ValueString(), state.Name.ValueString())
+	if err != nil || bucket == nil {
+		return false, err
+	}
+	registered, err := r.isRegistered(ctx, state.EnvironmentID.ValueString(), bucket.Id)
+	if err != nil || !registered {
+		return false, err
+	}
+	state.ID = types.StringValue(bucket.Id)
+	state.Name = types.StringValue(bucket.Name)
+	return true, nil
 }
 
 func (r *Bucket) readEnvironmentConfig(ctx context.Context, environmentID string) (*environmentConfig, error) {

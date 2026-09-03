@@ -107,6 +107,7 @@ type partialCreateFixture struct {
 	failConnect bool
 	exists      bool
 	connected   bool
+	trigger     bool
 	reads       int
 }
 
@@ -161,6 +162,10 @@ func (f *partialCreateFixture) serveHTTP(w http.ResponseWriter, r *http.Request)
 		}
 		_, _ = io.WriteString(w, `{"data":{"serviceInstanceUpdate":true}}`)
 
+	case "CreateDeploymentTrigger":
+		f.trigger = true
+		writeServiceDeploymentTriggerMutation(w, "deploymentTriggerCreate", "owner/repository", "master")
+
 	case "GetEnvironmentPrivateNetworks":
 		// **THE FIXTURE REPORTS NO PRIVATE NETWORK**, which is a real state:
 		// private networking can be disabled. `privatenet.Read` treats
@@ -176,13 +181,17 @@ func (f *partialCreateFixture) serveHTTP(w http.ResponseWriter, r *http.Request)
 		f.reads++
 		repoTriggers := []any{}
 		var source any
-		if f.connected {
+		if f.trigger {
 			repoTriggers = []any{map[string]any{
 				"node": map[string]any{
 					"id": "trigger-fixture", "environmentId": "environment-fixture",
 					"branch": "master", "repository": "owner/repository",
+					"provider": "github", "projectId": "project-fixture",
+					"serviceId": "service-fixture", "checkSuites": false,
 				},
 			}}
+		}
+		if f.connected {
 			source = map[string]any{"image": nil, "repo": "owner/repository"}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
@@ -214,6 +223,7 @@ func (f *partialCreateFixture) serveHTTP(w http.ResponseWriter, r *http.Request)
 	case "DeleteService":
 		f.exists = false
 		f.connected = false
+		f.trigger = false
 		_, _ = io.WriteString(w, `{"data":{"serviceDelete":true}}`)
 
 	default:

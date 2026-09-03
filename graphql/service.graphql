@@ -100,6 +100,12 @@ query ListProjectServices($projectId: String!) {
   }
 }
 
+query GetGitHubRepository($fullRepoName: String!) {
+  githubRepo(fullRepoName: $fullRepoName) {
+    defaultBranch
+  }
+}
+
 mutation CreateService($input: ServiceCreateInput!) {
   serviceCreate(input: $input) {
     ...ServiceFields
@@ -140,16 +146,9 @@ mutation DeleteService($id: String!, $environmentId: String) {
   serviceDelete(id: $id, environmentId: $environmentId)
 }
 
-# THE THING THAT MAKES A GITHUB-SOURCED SERVICE ACTUALLY DEPLOY.
-#
-# **A SERVICE CAN HAVE A REPOSITORY ATTACHED AND STILL NEVER BUILD.** The
-# source tells Railway what the service is made of; the TRIGGER is what
-# connects a push on a branch to a deployment. Without one the service sits
-# with `latestDeployment: null` forever, and nothing in the Railway UI or the
-# API says why — it looks correctly configured, because it is, apart from this.
-#
-# Observed against a live account: four services with their sources correctly
-# attached, zero `repoTriggers` between them, and no deployment ever.
+# THE THING THAT MAKES A GITHUB-SOURCED SERVICE ACTUALLY DEPLOY. The service
+# resource manages one by default; the standalone resource uses the same
+# operations when explicit ownership is requested.
 mutation CreateDeploymentTrigger($input: DeploymentTriggerCreateInput!) {
   deploymentTriggerCreate(input: $input) {
     ...DeploymentTriggerFields

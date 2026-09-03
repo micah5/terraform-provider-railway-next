@@ -1,9 +1,7 @@
-# **A SERVICE WITH A REPOSITORY SOURCE DOES NOT DEPLOY BY ITSELF.**
-#
-# `railway_service`'s `repository` and `branch` say what the service is made
-# of. They do not subscribe it to anything. Without a trigger the service sits
-# at no deployment forever, while the UI and the API both show it as correctly
-# configured — because it is, apart from this.
+# `railway_service` manages one deployment trigger automatically by default.
+# Set `auto_deploy = false` when the standalone resource should own the trigger
+# instead — for example to control check-suite gating or manage several
+# triggers explicitly.
 resource "railway_service" "web" {
   project_id     = railway_environment.uat.project_id
   environment_id = railway_environment.uat.id
@@ -12,6 +10,7 @@ resource "railway_service" "web" {
   source_type = "github"
   repository  = "example/app"
   branch      = "uat"
+  auto_deploy = false
 }
 
 resource "railway_deployment_trigger" "web" {
@@ -30,7 +29,5 @@ resource "railway_deployment_trigger" "web" {
   check_suites = true
 }
 
-# NO TRIGGER IS ALSO A VALID CONFIGURATION, and it is why this is a separate
-# resource rather than a field on the service. A service deployed only by CI or
-# by hand has a source and deliberately no trigger; folding the two together
-# would make that unexpressible.
+# With `auto_deploy = false`, omitting this resource is also valid for a service
+# deployed only by CI or by hand.
