@@ -2,6 +2,13 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [0.2.1] - 2026-09-04
+
+### Security
+
+- Rebuilt with Go 1.26.6 and updated gRPC, `golang.org/x/net`, and
+  `golang.org/x/text` to patched versions identified by `govulncheck`.
+
 ## [0.2.0] - 2026-09-04
 
 ### Fixed
