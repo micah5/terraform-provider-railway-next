@@ -2,7 +2,7 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [0.2.0] - 2026-09-03
+## [0.2.0] - 2026-09-04
 
 ### Fixed
 
@@ -56,6 +56,14 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 - Changing `railway_service.branch` now updates the deployment trigger before
   state is refreshed, avoiding `Provider produced inconsistent result after
   apply` when moving a service from one watched branch to another.
+- Service instance updates now carry the configured source instead of sending
+  `source: null` immediately after `serviceCreate` attached it. The provider
+  waits until Railway exposes both the source and managed deployment trigger,
+  preventing the post-apply refresh from planning to reconnect the repository.
+- Safe GraphQL reads retry HTTP-client deadlines while the enclosing resource
+  operation is still live. Eventual-consistency waits likewise tolerate
+  transient read timeouts and rate limits, so a single slow confirmation poll
+  no longer fails an already-accepted bucket deletion.
 - Bucket and PostgreSQL creates that time out after Railway accepts their
   change set now save a non-tainted provisional identity. A later refresh
   adopts the real bucket, service, and volume IDs by scoped name instead of

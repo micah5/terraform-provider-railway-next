@@ -8,11 +8,15 @@ on:
         required: true
         default: "tfacc-ci-"
       confirm_billable_resources:
-        description: "Type CREATE AND DESTROY to authorize disposable services, bucket, and Postgres"
+        description: "Type CREATE AND DESTROY to authorize disposable services, volumes, and Postgres"
         required: true
       github_repository:
         description: "Public GitHub owner/repository used by the two disposable services"
         required: true
+      github_branch:
+        description: "Branch used by the two disposable services"
+        required: true
+        default: "main"
 
 permissions:
   contents: read
@@ -36,9 +40,10 @@ jobs:
         with:
           terraform_version: "1.15.8"
           terraform_wrapper: false
-      - run: go test ./internal/provider -run '^TestAcc' -count=1 -v
+      - run: go test ./internal/provider -run '^TestAcc' -count=1 -timeout 30m -v
         env:
           TF_ACC: "1"
           RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
           RAILWAY_ACC_PROJECT_PREFIX: ${{ inputs.disposable_project_prefix }}
           RAILWAY_ACC_GITHUB_REPOSITORY: ${{ inputs.github_repository }}
+          RAILWAY_ACC_GITHUB_BRANCH: ${{ inputs.github_branch }}

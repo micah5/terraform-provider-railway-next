@@ -114,6 +114,33 @@ func TestTransportRetriesSafeReadAndHonorsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestTransportRetriesHTTPClientDeadlineOnSafeRead(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	doer := newRailwayDoer(Config{
+		Token: "token", TokenType: TokenTypeAccount, Version: "test", MaxRetries: 1,
+		HTTPDoer: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"data":{"ok":true}}`)),
+			}, nil
+		}),
+	})
+	response, err := doer.Do(graphqlRequest(t, "https://example.test/graphql", "query Test { ok }"))
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	drainAndClose(response.Body)
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
 func TestTransportDoesNotRetryMutation(t *testing.T) {
 	t.Parallel()
 

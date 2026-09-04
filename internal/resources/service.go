@@ -235,26 +235,13 @@ func (r *Service) Create(ctx context.Context, req resource.CreateRequest, resp *
 	if !r.resolveGitHubBranch(ctx, &plan, &resp.Diagnostics) {
 		return
 	}
-	// **THE SOURCE GOES IN THE CREATE, not a second mutation.**
-	//
-	// `ServiceCreateInput` accepts `source` and `branch`, and Railway's own API
-	// cookbook shows exactly that — "Create service from GitHub" is one call.
-	//
-	// The two-step form here called `serviceConnect` afterwards, and that
-	// mutation takes only a service id: it resolves the service INSTANCE
-	// itself, and in a project with several environments it resolves the wrong
-	// one. Against a project containing `ci` and `uat` it failed every time
-	// with `ServiceInstance not found`, while the instance demonstrably existed
-	// in the environment asked for.
-	//
-	// Reproduced outside Terraform to be sure it was the API and not the
-	// provider: calling `serviceConnect` by hand on a freshly created service
-	// gives the same error, and creating with `source` in one call attaches the
-	// repository to the right instance immediately.
-	//
-	// This also removes the partial-failure window entirely rather than making
-	// it recoverable: there is no longer a moment where the service exists and
-	// its source does not.
+	// Ask Railway to attach the source atomically during creation. Some
+	// workspace-token flows accept this input but initially expose the new
+	// service instance with source=null, so updateInstance reasserts the same
+	// source through the environment-aware serviceInstanceUpdate mutation once
+	// the instance exists. That fallback deliberately does not use
+	// serviceConnect, whose implicit environment selection is ambiguous in
+	// multi-environment projects.
 	createInput := railway.ServiceCreateInput{
 		ProjectId:     plan.ProjectID.ValueString(),
 		EnvironmentId: stringPointer(plan.EnvironmentID),
@@ -325,6 +312,14 @@ func (r *Service) Create(ctx context.Context, req resource.CreateRequest, resp *
 		saveState()
 		return
 	}
+	if err := r.waitForServiceConfiguration(ctx, &plan); err != nil {
+		resp.Diagnostics.AddError(
+			"Railway service created but its source configuration did not converge",
+			client.DecodeAPIError(err).Error(),
+		)
+		saveState()
+		return
+	}
 	if !r.refresh(ctx, &plan, true, &resp.Diagnostics) {
 		saveState()
 		return
@@ -379,49 +374,17 @@ func (r *Service) Update(ctx context.Context, req resource.UpdateRequest, resp *
 			return
 		}
 	}
-	if serviceSourceChanged(&plan, &prior) {
-		// **`serviceInstanceUpdate`, NOT `serviceConnect`** — for the same
-		// reason Create no longer uses the latter.
-		//
-		// `serviceConnect` takes only a service id and resolves the service
-		// INSTANCE itself, which in a project with several environments
-		// resolves the wrong one: it fails with `ServiceInstance not found`
-		// while the instance demonstrably exists in the environment asked for.
-		// Verified by calling both mutations by hand against live Railway.
-		//
-		// `serviceInstanceUpdate` takes an explicit `environmentId`, so the
-		// instance is named rather than guessed — and its input carries
-		// `source`, so it does the same job without the ambiguity.
-		input := railway.ServiceInstanceUpdateInput{
-			Source: &railway.ServiceSourceInput{
-				Image: stringPointer(plan.Image),
-				Repo:  stringPointer(plan.Repository),
-			},
-		}
-		if plan.SourceType.ValueString() == "empty" {
-			input = railway.ServiceInstanceUpdateInput{}
-		}
-		if _, err := railway.UpdateServiceInstance(
-			ctx,
-			r.client.GraphQL(),
-			plan.EnvironmentID.ValueString(),
-			plan.ID.ValueString(),
-			input,
-		); err != nil {
-			resp.Diagnostics.AddError("Unable to update Railway service source", client.DecodeAPIError(err).Error())
-			return
-		}
-
-		// NO SEPARATE NAME UPDATE HERE. An earlier version re-sent the name
-		// alongside the source change and got `Not Authorized` — the rename
-		// block above already handles a changed name, and repeating it inside
-		// the source branch asked for a permission the source change does not
-		// need.
-	}
 	if !r.updateInstance(ctx, &plan, &resp.Diagnostics) {
 		return
 	}
 	if !r.reconcileDeploymentTrigger(ctx, &plan, &prior, &resp.Diagnostics) {
+		return
+	}
+	if err := r.waitForServiceConfiguration(ctx, &plan); err != nil {
+		resp.Diagnostics.AddError(
+			"Railway service source configuration did not converge",
+			client.DecodeAPIError(err).Error(),
+		)
 		return
 	}
 	if !r.refresh(ctx, &plan, true, &resp.Diagnostics) {
@@ -483,6 +446,13 @@ func (r *Service) updateInstance(ctx context.Context, plan *serviceModel, diagno
 	if diagnostics.HasError() {
 		return false
 	}
+	var source *railway.ServiceSourceInput
+	switch plan.SourceType.ValueString() {
+	case "github":
+		source = &railway.ServiceSourceInput{Repo: stringPointer(plan.Repository)}
+	case "image":
+		source = &railway.ServiceSourceInput{Image: stringPointer(plan.Image)}
+	}
 	input := railway.ServiceInstanceUpdateInput{
 		BuildCommand:            stringPointer(plan.BuildCommand),
 		Builder:                 builderPointer(plan.Builder),
@@ -501,6 +471,7 @@ func (r *Service) updateInstance(ctx context.Context, plan *serviceModel, diagno
 		RestartPolicyType:       restartPolicyPointer(plan.RestartPolicyType),
 		RootDirectory:           stringPointer(plan.RootDirectory),
 		SleepApplication:        boolPointer(plan.SleepApplication),
+		Source:                  source,
 		StartCommand:            stringPointer(plan.StartCommand),
 		WatchPatterns:           watchPatterns,
 	}
@@ -556,6 +527,59 @@ func (r *Service) waitForServiceInstance(ctx context.Context, plan *serviceModel
 		}
 		for _, edge := range result.Environment.ServiceInstances.Edges {
 			if edge.Node.ServiceId == plan.ID.ValueString() {
+				return nil
+			}
+		}
+		return errNotReady
+	})
+}
+
+// waitForServiceConfiguration prevents an immediately-following Terraform
+// refresh from observing the eventually-consistent service instance before
+// Railway has exposed the source and deployment trigger just accepted by its
+// mutations. Returning earlier produces a non-empty post-apply plan that tries
+// to attach the same repository again.
+func (r *Service) waitForServiceConfiguration(ctx context.Context, plan *serviceModel) error {
+	return awaitConsistency(ctx, consistencyPollInterval, func(ctx context.Context) error {
+		result, err := railway.GetService(
+			ctx,
+			r.client.GraphQL(),
+			plan.ID.ValueString(),
+			plan.EnvironmentID.ValueString(),
+		)
+		if err != nil {
+			return err
+		}
+
+		sourceReady := false
+		for _, edge := range result.Environment.ServiceInstances.Edges {
+			if edge.Node.ServiceId != plan.ID.ValueString() {
+				continue
+			}
+			switch plan.SourceType.ValueString() {
+			case "github":
+				sourceReady = edge.Node.Source != nil && edge.Node.Source.Repo != nil &&
+					*edge.Node.Source.Repo == plan.Repository.ValueString()
+			case "image":
+				sourceReady = edge.Node.Source != nil && edge.Node.Source.Image != nil &&
+					*edge.Node.Source.Image == plan.Image.ValueString()
+			case "empty":
+				sourceReady = edge.Node.Source == nil ||
+					(edge.Node.Source.Repo == nil && edge.Node.Source.Image == nil)
+			}
+			break
+		}
+		if !sourceReady {
+			return errNotReady
+		}
+
+		if plan.SourceType.ValueString() != "github" || !plan.AutoDeploy.ValueBool() {
+			return nil
+		}
+		for _, edge := range result.Service.RepoTriggers.Edges {
+			if edge.Node.EnvironmentId == plan.EnvironmentID.ValueString() &&
+				edge.Node.Repository == plan.Repository.ValueString() &&
+				edge.Node.Branch == plan.Branch.ValueString() {
 				return nil
 			}
 		}
@@ -802,12 +826,6 @@ func validateServiceSource(plan *serviceModel, diagnostics *diag.Diagnostics) bo
 		}
 	}
 	return true
-}
-
-func serviceSourceChanged(plan, prior *serviceModel) bool {
-	return plan.SourceType.ValueString() != prior.SourceType.ValueString() ||
-		plan.Repository.ValueString() != prior.Repository.ValueString() ||
-		plan.Image.ValueString() != prior.Image.ValueString()
 }
 
 func (r *Service) resolveGitHubBranch(ctx context.Context, plan *serviceModel, diagnostics *diag.Diagnostics) bool {

@@ -9,8 +9,8 @@ This is an independent community provider and is not affiliated with or
 endorsed by Railway Corporation.
 
 > Release status: initial community release. The fixture-backed suite and
-> guarded disposable-project bucket/PostgreSQL lifecycle acceptance test passed
-> on July 27, 2026. Review destructive plans carefully and begin with
+> guarded disposable-project service/PostgreSQL lifecycle acceptance test passed
+> on September 3, 2026. Review destructive plans carefully and begin with
 > disposable Railway projects before adopting the provider for production.
 
 ## Requirements
@@ -114,11 +114,13 @@ Acceptance tests are opt-in and guarded:
 TF_ACC=1 \
 RAILWAY_API_TOKEN=... \
 RAILWAY_ACC_PROJECT_PREFIX=tfacc-local- \
-go test ./internal/provider -run '^TestAcc' -v
+RAILWAY_ACC_GITHUB_REPOSITORY=owner/repository \
+RAILWAY_ACC_GITHUB_BRANCH=main \
+go test ./internal/provider -run '^TestAcc' -count=1 -timeout 30m -v
 ```
 
 They must use a disposable account/workspace, are deliberately non-parallel,
-and create a bucket and PostgreSQL service that may be billable. See
+and create services, volumes, and PostgreSQL that may be billable. See
 [`docs/handbook/testing.md`](docs/handbook/testing.md).
 
 Local provider overrides, imports, releases, and known API boundaries are

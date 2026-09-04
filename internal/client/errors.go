@@ -86,6 +86,19 @@ func IsAmbiguousMutationError(err error) bool {
 			isTransportError(err))
 }
 
+// IsRetryableReadError reports transport conditions that can safely be retried
+// because a GraphQL query has no side effects. The caller must still check its
+// own operation context so a configured resource timeout remains the ceiling.
+func IsRetryableReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rateLimit *RateLimitError
+	return errors.As(err, &rateLimit) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		isTransportError(err)
+}
+
 func isTransportError(err error) bool {
 	var rateLimit *RateLimitError
 	return !errors.As(err, &rateLimit) &&

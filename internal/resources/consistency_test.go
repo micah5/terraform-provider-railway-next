@@ -66,6 +66,25 @@ func TestAwaitConsistencyStopsOnRealErrors(t *testing.T) {
 	}
 }
 
+func TestAwaitConsistencyRetriesTransientReadErrors(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	err := awaitConsistency(context.Background(), time.Millisecond, func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("probe ran %d times, want 2", calls)
+	}
+}
+
 // TestAwaitConsistencyProbesBeforeSleeping keeps the common case fast.
 //
 // The object is usually already there, and waiting a full interval to discover

@@ -67,7 +67,7 @@ func (d *railwayDoer) Do(req *http.Request) (*http.Response, error) {
 
 		response, requestErr := d.doer.Do(attemptReq)
 		if requestErr != nil {
-			if !safeRead || attempt == attempts-1 || !retryableNetworkError(requestErr) {
+			if !safeRead || attempt == attempts-1 || !retryableNetworkError(req.Context(), requestErr) {
 				return nil, fmt.Errorf("Railway GraphQL request failed: %w", requestErr)
 			}
 			if err := wait(req.Context(), backoff(attempt, 0)); err != nil {
@@ -130,8 +130,11 @@ func retryableStatus(status int) bool {
 	}
 }
 
-func retryableNetworkError(err error) bool {
-	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+func retryableNetworkError(ctx context.Context, err error) bool {
+	// An HTTP-client timeout is retryable while the enclosing request context
+	// remains live. Cancellation of that enclosing context is the caller's
+	// resource deadline and must stop immediately.
+	return ctx.Err() == nil && !errors.Is(err, context.Canceled)
 }
 
 func backoff(attempt int, retryAfter time.Duration) time.Duration {

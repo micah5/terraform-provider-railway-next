@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/micah5/terraform-provider-railway-next/internal/client"
 )
 
 // **RAILWAY IS EVENTUALLY CONSISTENT, AND THAT IS THE THROUGH-LINE OF EVERY
@@ -49,17 +51,22 @@ const consistencyPollInterval = time.Second
 var errNotReady = errors.New("not ready")
 
 // awaitConsistency polls until probe returns nil, the context expires, or probe
-// returns an error other than errNotReady.
+// returns a non-retryable error.
 //
 // A probe that returns a REAL error stops immediately: an authorisation failure
 // or a malformed request will not fix itself, and retrying it for the whole
-// timeout turns a clear error into a slow one. Only `errNotReady` means "look
-// again".
+// timeout turns a clear error into a slow one. `errNotReady` and transient
+// read transport failures mean "look again"; authentication and schema errors
+// still stop immediately.
 //
 // The first probe runs BEFORE any sleep, because the object is often already
 // there — waiting a second to discover that is a second added to every apply.
 func awaitConsistency(ctx context.Context, interval time.Duration, probe func(context.Context) error) error {
-	if err := probe(ctx); !errors.Is(err, errNotReady) {
+	retryable := func(err error) bool {
+		return errors.Is(err, errNotReady) ||
+			(ctx.Err() == nil && client.IsRetryableReadError(err))
+	}
+	if err := probe(ctx); !retryable(err) {
 		return err
 	}
 
@@ -80,7 +87,7 @@ func awaitConsistency(ctx context.Context, interval time.Duration, probe func(co
 
 		case <-ticker.C:
 			err := probe(ctx)
-			if !errors.Is(err, errNotReady) {
+			if !retryable(err) {
 				return err
 			}
 			lastErr = err

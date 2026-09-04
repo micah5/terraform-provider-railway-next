@@ -23,7 +23,7 @@ import (
 // Optional+Computed service setting whose Railway response may be null and
 // verifies that no unknown planned value survives into post-apply state.
 func TestServiceProtocolCreateNormalizesOptionalComputedValues(t *testing.T) {
-	var fixture serviceFixture
+	fixture := serviceFixture{sourceVisibleAfter: 4}
 	server := httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
 	defer server.Close()
 
@@ -72,6 +72,12 @@ resource "railway_service" "api" {
 			},
 		},
 	})
+
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.getServiceCalls < fixture.sourceVisibleAfter {
+		t.Fatalf("provider returned before the Railway source converged: got %d reads, want at least %d", fixture.getServiceCalls, fixture.sourceVisibleAfter)
+	}
 }
 
 // TestServiceProtocolBranchUpdateUpdatesDeploymentTrigger guards the v0.2
@@ -182,14 +188,15 @@ func checkNoUnknownState(name string) resource.TestCheckFunc {
 }
 
 type serviceFixture struct {
-	mu              sync.Mutex
-	exists          bool
-	connected       bool
-	triggerExists   bool
-	repository      string
-	branch          string
-	triggerUpdates  int
-	getServiceCalls int
+	mu                 sync.Mutex
+	exists             bool
+	connected          bool
+	triggerExists      bool
+	repository         string
+	branch             string
+	triggerUpdates     int
+	getServiceCalls    int
+	sourceVisibleAfter int
 }
 
 func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -210,16 +217,11 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GetGitHubRepository":
 		_, _ = io.WriteString(w, `{"data":{"githubRepo":{"defaultBranch":"main"}}}`)
 	case "CreateService":
-		// THE SOURCE IS ATTACHED BY THE CREATE ITSELF now, matching Railway's
-		// own API cookbook — `ServiceCreateInput` carries `source` and
-		// `branch`, and the provider no longer makes a second `serviceConnect`
-		// call. The fixture has to model that, or it reports a service with no
-		// source and the plan never converges.
+		// Railway can accept source in ServiceCreateInput while the resulting
+		// instance still reports source=null. Model that live behavior so the
+		// environment-aware serviceInstanceUpdate fallback is required.
 		f.exists = true
 		if variables, ok := request.Variables["input"].(map[string]any); ok {
-			if _, hasSource := variables["source"]; hasSource {
-				f.connected = true
-			}
 			f.branch, _ = variables["branch"].(string)
 			if source, ok := variables["source"].(map[string]any); ok {
 				f.repository, _ = source["repo"].(string)
@@ -230,6 +232,19 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.connected = true
 		writeServiceMutation(w, "serviceConnect")
 	case "UpdateServiceInstance":
+		if input, ok := request.Variables["input"].(map[string]any); ok {
+			if source, ok := input["source"].(map[string]any); ok {
+				if repository, ok := source["repo"].(string); ok && repository != "" {
+					f.connected = true
+					f.repository = repository
+				}
+				if image, ok := source["image"].(string); ok && image != "" {
+					f.connected = true
+				}
+			} else {
+				f.connected = false
+			}
+		}
 		_, _ = io.WriteString(w, `{"data":{"serviceInstanceUpdate":true}}`)
 	case "CreateDeploymentTrigger":
 		input, _ := request.Variables["input"].(map[string]any)
@@ -275,7 +290,7 @@ func (f *serviceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				},
 			}}
 		}
-		if f.connected {
+		if f.connected && f.getServiceCalls >= f.sourceVisibleAfter {
 			source = map[string]any{"image": nil, "repo": "owner/repository"}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{

@@ -16,15 +16,23 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
-// TestAccParallelServiceBucketAndPostgresLifecycle is intentionally one
+// TestAccParallelServiceAndPostgresLifecycle is intentionally one
 // non-parallel test process, while Terraform itself uses its normal parallelism
-// to exercise concurrent service, bucket, and PostgreSQL environment changes.
+// to exercise concurrent service, volume, and PostgreSQL environment changes.
 // It creates billable resources only when TF_ACC=1 and the explicit
 // disposable-project guard passes.
-func TestAccParallelServiceBucketAndPostgresLifecycle(t *testing.T) {
+//
+// Buckets are excluded because Railway currently accepts and ignores their
+// public-API deletion change set. Keeping one here makes post-test destroy fail
+// by design; bucket create/timeout/adoption remains covered at protocol level.
+func TestAccParallelServiceAndPostgresLifecycle(t *testing.T) {
 	prefix := os.Getenv("RAILWAY_ACC_PROJECT_PREFIX")
 	name := fmt.Sprintf("%s%d", prefix, time.Now().Unix())
-	config := acceptanceParallelConfig(name, os.Getenv("RAILWAY_ACC_GITHUB_REPOSITORY"))
+	config := acceptanceParallelConfig(
+		name,
+		os.Getenv("RAILWAY_ACC_GITHUB_REPOSITORY"),
+		os.Getenv("RAILWAY_ACC_GITHUB_BRANCH"),
+	)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -37,8 +45,6 @@ func TestAccParallelServiceBucketAndPostgresLifecycle(t *testing.T) {
 			{
 				Config: config,
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttrSet("railway_bucket.cache", "id"),
-					resource.TestCheckResourceAttr("railway_bucket.cache", "region", "ams"),
 					resource.TestCheckResourceAttrSet("railway_postgres.main", "service_id"),
 					resource.TestCheckResourceAttrSet("railway_postgres.main", "volume_id"),
 					resource.TestCheckResourceAttr("railway_postgres.main", "version", "18"),
@@ -56,12 +62,6 @@ func TestAccParallelServiceBucketAndPostgresLifecycle(t *testing.T) {
 			{
 				Config:   config,
 				PlanOnly: true,
-			},
-			{
-				ResourceName:      "railway_bucket.cache",
-				ImportState:       true,
-				ImportStateIdFunc: compositeImportID("railway_bucket.cache", "project_id", "environment_id", "id"),
-				ImportStateVerify: true,
 			},
 			{
 				ResourceName:      "railway_postgres.main",
@@ -102,6 +102,9 @@ func acceptancePreCheck(t *testing.T) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		t.Fatal("RAILWAY_ACC_GITHUB_REPOSITORY must be an explicit GitHub owner/repository")
 	}
+	if strings.TrimSpace(os.Getenv("RAILWAY_ACC_GITHUB_BRANCH")) == "" {
+		t.Fatal("RAILWAY_ACC_GITHUB_BRANCH must name the branch used by the disposable services")
+	}
 }
 
 func compositeImportID(resourceName string, attributes ...string) resource.ImportStateIdFunc {
@@ -126,7 +129,7 @@ func compositeImportID(resourceName string, attributes ...string) resource.Impor
 	}
 }
 
-func acceptanceParallelConfig(projectName, repository string) string {
+func acceptanceParallelConfig(projectName, repository, branch string) string {
 	return fmt.Sprintf(`
 provider "railway" {
   token_type = "account"
@@ -142,21 +145,13 @@ resource "railway_project" "test" {
   focused_pr_environments      = false
 }
 
-resource "railway_bucket" "cache" {
-  project_id     = railway_project.test.id
-  environment_id = railway_project.test.default_environment_id
-  name           = "tfacc-cache"
-  region         = "ams"
-}
-
 resource "railway_service" "api" {
   project_id     = railway_project.test.id
   environment_id = railway_project.test.default_environment_id
   name           = "tfacc-api"
   source_type    = "github"
   repository     = %q
-  branch         = "master"
-  config_path    = "railway.json"
+  branch         = %q
   regions        = { ams = 1 }
 }
 
@@ -166,8 +161,7 @@ resource "railway_service" "ui" {
   name           = "tfacc-ui"
   source_type    = "github"
   repository     = %q
-  branch         = "master"
-  config_path    = "ui/railway.json"
+  branch         = %q
   regions        = { ams = 1 }
 }
 
@@ -186,5 +180,5 @@ resource "railway_postgres" "main" {
   version        = "18"
   region         = "ams"
 }
-`, projectName, repository, repository)
+`, projectName, repository, branch, repository, branch)
 }

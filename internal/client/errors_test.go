@@ -38,3 +38,17 @@ func TestAmbiguousMutationError(t *testing.T) {
 		t.Fatal("rate limit is explicit, not ambiguous")
 	}
 }
+
+func TestRetryableReadError(t *testing.T) {
+	t.Parallel()
+
+	if !IsRetryableReadError(context.DeadlineExceeded) {
+		t.Fatal("HTTP-client deadline must be retryable for a safe read")
+	}
+	if !IsRetryableReadError(&RateLimitError{}) {
+		t.Fatal("rate limiting must be retryable for a safe read")
+	}
+	if IsRetryableReadError(context.Canceled) {
+		t.Fatal("explicit cancellation must not be retried")
+	}
+}
